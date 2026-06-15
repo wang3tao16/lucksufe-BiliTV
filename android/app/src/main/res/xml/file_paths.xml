@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 应用外部文件目录，用于存放下载的 APK -->
+    <external-files-path name="external_files" path="." />
+    <!-- 缓存目录 -->
+    <cache-path name="cache" path="." />
+</paths>

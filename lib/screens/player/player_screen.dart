@@ -1,0 +1,462 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:canvas_danmaku/canvas_danmaku.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
+import '../../models/video.dart';
+import '../../services/settings_service.dart';
+import 'widgets/video_layer.dart';
+import 'widgets/danmaku_layer.dart';
+import 'widgets/controls_overlay.dart';
+import 'widgets/settings_panel.dart';
+import 'widgets/episode_panel.dart';
+import 'widgets/pause_indicator.dart';
+import 'widgets/action_buttons.dart';
+import 'widgets/up_panel.dart';
+import 'widgets/related_panel.dart';
+import 'widgets/mini_progress_bar.dart';
+import 'widgets/seek_preview_thumbnail.dart';
+import '../../widgets/time_display.dart';
+import 'mixins/player_state_mixin.dart';
+import 'mixins/player_action_mixin.dart';
+import 'mixins/player_event_mixin.dart';
+
+/// 视频播放器页面 (使用 Mixin 重构)
+class PlayerScreen extends StatefulWidget {
+  final Video video;
+
+  const PlayerScreen({super.key, required this.video});
+
+  @override
+  State<PlayerScreen> createState() => _PlayerScreenState();
+}
+
+class _PlayerScreenState extends State<PlayerScreen>
+    with
+        PlayerStateMixin,
+        PlayerActionMixin,
+        PlayerEventMixin,
+        WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // 保持屏幕常亮，防止电视待机
+    WakelockPlus.enable();
+    loadSettings();
+    initializePlayer();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    // 应用进入后台时上报进度 (包括按主页键)
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      reportPlaybackProgress();
+    }
+  }
+
+  @override
+  void dispose() {
+    // 恢复屏幕休眠
+    WakelockPlus.disable();
+    WidgetsBinding.instance.removeObserver(this);
+    hideTimer?.cancel();
+    progressReportTimer?.cancel();
+    // 退出时上报进度
+    reportPlaybackProgress();
+
+    // 通过 mixin 方法销毁播放器
+    disposePlayer();
+    super.dispose();
+  }
+
+  // 触控相关状态
+  Offset? _touchStart;
+  DateTime? _lastTapTime;
+  static const _doubleTapThreshold = Duration(milliseconds: 300);
+  static const _swipeThreshold = 50.0;
+
+  void _onVideoTouchStart(DragStartDetails details) {
+    _touchStart = details.globalPosition;
+  }
+
+  void _onVideoTouchEnd(DragEndDetails details) {
+    _touchStart = null;
+  }
+
+  void _onVideoTouchUpdate(DragUpdateDetails details) {
+    if (_touchStart == null || videoController == null) return;
+
+    final dx = details.globalPosition.dx - _touchStart!.dx;
+
+    if (dx.abs() > _swipeThreshold) {
+      if (dx > 0) {
+        seekForward();
+      } else {
+        seekBackward();
+      }
+      _touchStart = details.globalPosition;
+    }
+  }
+
+  void _onVideoTapUp(TapUpDetails details) {
+    final now = DateTime.now();
+
+    if (_lastTapTime != null && now.difference(_lastTapTime!) < _doubleTapThreshold) {
+      togglePlayPause();
+      _lastTapTime = null;
+      return;
+    }
+
+    _lastTapTime = now;
+    toggleControls();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: onPopInvoked,
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: Focus(
+          autofocus: true,
+          onKeyEvent: handleGlobalKeyEvent,
+          child: Stack(
+            children: [
+              // 视频层 (触控区域：单击切换控制栏，双击播放/暂停，滑动快进快退)
+              GestureDetector(
+                onTapUp: _onVideoTapUp,
+                onHorizontalDragStart: _onVideoTouchStart,
+                onHorizontalDragUpdate: _onVideoTouchUpdate,
+                onHorizontalDragEnd: _onVideoTouchEnd,
+                behavior: HitTestBehavior.opaque,
+                child: VideoLayer(
+                  controller: videoController,
+                  isLoading: isLoading,
+                  errorMessage: errorMessage,
+                ),
+              ),
+
+              // 弹幕层
+              if (!isLoading && videoController != null && danmakuEnabled)
+                DanmakuLayer(
+                  onCreated: (c) => danmakuController = c,
+                  option: DanmakuOption(
+                    opacity: danmakuOpacity,
+                    fontSize: danmakuFontSize,
+                    // 弹幕飞行速度随播放倍速同步调整
+                    duration: danmakuSpeed / playbackSpeed,
+                    area: danmakuArea,
+                    hideTop: hideTopDanmaku,
+                    hideBottom: hideBottomDanmaku,
+                  ),
+                ),
+
+              // 暂停指示器
+              if (!isLoading && videoController != null)
+                PauseIndicator(controller: videoController),
+
+              // 迷你进度条 (控制栏隐藏时显示)
+              if (!isLoading &&
+                  videoController != null &&
+                  !showControls &&
+                  SettingsService.showMiniProgress)
+                MiniProgressBar(
+                  position: videoController!.value.position,
+                  duration: videoController!.value.duration,
+                ),
+
+              // 快进快退指示器 (含预览缩略图)
+              if (showSeekIndicator && videoController != null)
+                Center(
+                  child: Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.75),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // 预览模式: 显示缩略图
+                        if (isSeekPreviewMode &&
+                            previewPosition != null &&
+                            videoshotData != null)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 12),
+                            child: SeekPreviewThumbnail(
+                              videoshotData: videoshotData!,
+                              previewPosition: previewPosition!,
+                              scale: 0.6,
+                            ),
+                          ),
+                        // 时间指示器
+                        Text(
+                          isSeekPreviewMode && previewPosition != null
+                              ? '${_formatSeekTime(previewPosition!)} / ${_formatSeekTime(videoController!.value.duration)}'
+                              : '${_formatSeekTime(videoController!.value.position)} / ${_formatSeekTime(videoController!.value.duration)}',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 24,
+                            fontWeight: FontWeight.bold,
+                            shadows: [
+                              Shadow(
+                                blurRadius: 4,
+                                color: Colors.black,
+                                offset: Offset(0, 1),
+                              ),
+                            ],
+                          ),
+                        ),
+                        // 预览模式提示
+                        if (isSeekPreviewMode)
+                          const Padding(
+                            padding: EdgeInsets.only(top: 8),
+                            child: Text(
+                              '按确定跳转',
+                              style: TextStyle(
+                                color: Colors.white70,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+
+              // 控制界面
+              if (!isLoading && videoController != null)
+                AnimatedOpacity(
+                  opacity: showControls ? 1.0 : 0.0,
+                  duration: const Duration(milliseconds: 300),
+                  child: ControlsOverlay(
+                    video: getDisplayVideo(),
+                    controller: videoController!,
+                    showControls: showControls,
+                    focusedIndex: focusedButtonIndex,
+                    onBack: () => Navigator.of(context).pop(),
+                    onPlayPause: togglePlayPause,
+                    onSettings: () {
+                      setState(() {
+                        showSettingsPanel = true;
+                        hideTimer?.cancel();
+                      });
+                    },
+                    onEpisodes: () {
+                      setState(() {
+                        showEpisodePanel = true;
+                        hideTimer?.cancel();
+                      });
+                    },
+                    isDanmakuEnabled: danmakuEnabled,
+                    onToggleDanmaku: toggleDanmaku,
+                    currentQuality: currentQualityDesc,
+                    onQualityClick: showQualityPicker,
+                    isProgressBarFocused: isProgressBarFocused,
+                    previewPosition: previewPosition,
+                    alwaysShowPlayerTime: SettingsService.alwaysShowPlayerTime,
+                    onlineCount: onlineCount,
+                    danmakuCount: danmakuList.length,
+                  ),
+                ),
+
+              // 常驻时间显示 (当启用且不显示控制栏时，或 controlsOverlay 隐藏了其内部时间时)
+              // 注意：ControlsOverlay 在 alwaysShowPlayerTime=true 时会隐藏内部时间但保留占位
+              // 常驻时间显示 (当启用且不显示控制栏时，或 controlsOverlay 隐藏了其内部时间时)
+              // 注意：ControlsOverlay 在 alwaysShowPlayerTime=true 时会隐藏内部时间但保留占位
+              if (SettingsService.alwaysShowPlayerTime)
+                const Positioned(top: 20, right: 30, child: TimeDisplay()),
+
+              // 进度条拖动预览
+              if (isProgressBarFocused &&
+                  previewPosition != null &&
+                  videoController != null)
+                _buildProgressPreview(),
+
+              // 点赞/投币/收藏按钮
+              if (showActionButtons && !isLoading && videoController != null)
+                Positioned(
+                  bottom: 100,
+                  left: 0,
+                  right: 0,
+                  child: Center(
+                    child: ActionButtons(
+                      video: widget.video,
+                      aid: aid ?? 0,
+                      isFocused: showActionButtons,
+                      onFocusExit: () {
+                        setState(() => showActionButtons = false);
+                        startHideTimer();
+                      },
+                      onUserInteraction: () {
+                        startHideTimer();
+                      },
+                    ),
+                  ),
+                ),
+
+              // 选集面板
+              if (showEpisodePanel)
+                EpisodePanel(
+                  episodes: episodes,
+                  currentCid: cid ?? 0,
+                  focusedIndex: focusedEpisodeIndex,
+                  onEpisodeSave: switchEpisode,
+                  onClose: () {
+                    setState(() {
+                      showEpisodePanel = false;
+                      showControls = true;
+                    });
+                    startHideTimer();
+                  },
+                ),
+
+              // 设置面板
+              if (showSettingsPanel)
+                SettingsPanel(
+                  menuType: settingsMenuType,
+                  focusedIndex: focusedSettingIndex,
+                  qualityDesc: currentQualityDesc,
+                  playbackSpeed: playbackSpeed,
+                  availableSpeeds: availableSpeeds,
+                  danmakuEnabled: danmakuEnabled,
+                  danmakuOpacity: danmakuOpacity,
+                  danmakuFontSize: danmakuFontSize,
+                  danmakuArea: danmakuArea,
+                  danmakuSpeed: danmakuSpeed,
+                  hideTopDanmaku: hideTopDanmaku,
+                  hideBottomDanmaku: hideBottomDanmaku,
+                  onNavigate: (type, index) {
+                    setState(() {
+                      settingsMenuType = type;
+                      focusedSettingIndex = index;
+                    });
+                  },
+                  onQualityPicker: showQualityPicker,
+                ),
+
+              // UP主面板
+              if (showUpPanel)
+                UpPanel(
+                  upName: widget.video.ownerName,
+                  upFace: widget.video.ownerFace,
+                  upMid: widget.video.ownerMid,
+                  onVideoSelect: (video) {
+                    Navigator.pushReplacement(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => PlayerScreen(video: video),
+                      ),
+                    );
+                  },
+                  onClose: () {
+                    setState(() {
+                      showUpPanel = false;
+                      showControls = true;
+                    });
+                    startHideTimer();
+                  },
+                ),
+
+              // 更多视频面板
+              if (showRelatedPanel)
+                RelatedPanel(
+                  bvid: widget.video.bvid,
+                  onVideoSelect: (video) {
+                    Navigator.pushReplacement(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => PlayerScreen(video: video),
+                      ),
+                    );
+                  },
+                  onClose: () {
+                    setState(() {
+                      showRelatedPanel = false;
+                      showControls = true;
+                    });
+                    startHideTimer();
+                  },
+                ),
+
+              // 插件跳过按钮
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildProgressPreview() {
+    final total = videoController!.value.duration;
+    final preview = previewPosition!;
+    final progress = total.inMilliseconds > 0
+        ? preview.inMilliseconds / total.inMilliseconds
+        : 0.0;
+
+    String formatDuration(Duration d) {
+      final h = d.inHours;
+      final m = d.inMinutes % 60;
+      final s = d.inSeconds % 60;
+      if (h > 0) {
+        return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+      }
+      return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+    }
+
+    return Positioned(
+      bottom: 60,
+      left: 40,
+      right: 40,
+      child: Column(
+        children: [
+          Text(
+            '${formatDuration(preview)} / ${formatDuration(total)}',
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 24,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Container(
+            height: 8,
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.3),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: FractionallySizedBox(
+              alignment: Alignment.centerLeft,
+              widthFactor: progress.clamp(0.0, 1.0),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: const Color(0xFFfb7299),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            '← → 拖动  ↑ 取消  确定 跳转',
+            style: TextStyle(color: Colors.grey, fontSize: 14),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _formatSeekTime(Duration d) {
+    final h = d.inHours;
+    final m = d.inMinutes % 60;
+    final s = d.inSeconds % 60;
+    if (h > 0) {
+      return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+    }
+    return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+  }
+
+}
